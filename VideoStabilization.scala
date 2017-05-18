@@ -9,7 +9,7 @@ object VideoStabilization extends SpatialApp {
 
   val R = 128  // FIXME
   val C = 128  // FIXME
-  val t = 100  // FIXME
+  val t = 50.to[Int16]  // FIXME
   val n = 12
   val lb_height = 7
   val lb_width = 640
@@ -22,6 +22,7 @@ object VideoStabilization extends SpatialApp {
   type UInt5 = FixPt[FALSE,_5,_0]
   type UInt6 = FixPt[FALSE,_6,_0]
   type UInt3 = FixPt[FALSE,_3,_0]
+  type UInt1 = FixPt[FALSE,_1,_0]
   @struct case class Pixel24(b: UInt8, g: UInt8, r: UInt8)
   @struct case class Pixel16(b: UInt5, g: UInt6, r: UInt5)
 
@@ -29,7 +30,8 @@ object VideoStabilization extends SpatialApp {
 
   @virtualize
   def detect_FAST(): Unit = {
-    val imgIn  = StreamIn[Pixel24](target.VideoCamera)
+    val imgIn  = StreamIn[Pixel24](target.VideoCamera)  // TODO: change back to Pixel16
+    val imgIn2  = StreamIn[Pixel24](target.VideoCamera)  // TODO: change back to Pixel16
     val imgOut = StreamOut[Pixel24](target.VGA)
     // val imgOut = StreamOut[Pixel16](target.VGA)
 
@@ -54,10 +56,56 @@ object VideoStabilization extends SpatialApp {
         sr_coord(15) = Coordinate(1.to[Int16], 1.to[Int16])
       }
 
+      val descriptor_coord_1 = RegFile[Coordinate](16)
+      Pipe{
+        descriptor_coord_1(0) = Coordinate(0.to[Int16], 0.to[Int16])
+        descriptor_coord_1(1) = Coordinate(1.to[Int16], 0.to[Int16])
+        descriptor_coord_1(2) = Coordinate(2.to[Int16], 0.to[Int16])
+        descriptor_coord_1(3) = Coordinate(3.to[Int16], 0.to[Int16])
+        descriptor_coord_1(4) = Coordinate(4.to[Int16], 0.to[Int16])
+        descriptor_coord_1(5) = Coordinate(5.to[Int16], 0.to[Int16])
+        descriptor_coord_1(6) = Coordinate(5.to[Int16], 0.to[Int16])
+
+        descriptor_coord_1(7) = Coordinate(0.to[Int16], 0.to[Int16])
+        descriptor_coord_1(8) = Coordinate(0.to[Int16], 1.to[Int16])
+        descriptor_coord_1(9) = Coordinate(0.to[Int16], 2.to[Int16])
+        descriptor_coord_1(10) = Coordinate(0.to[Int16], 3.to[Int16])
+        descriptor_coord_1(11) = Coordinate(0.to[Int16], 4.to[Int16])
+        descriptor_coord_1(12) = Coordinate(0.to[Int16], 5.to[Int16])
+        descriptor_coord_1(13) = Coordinate(0.to[Int16], 6.to[Int16])
+
+        descriptor_coord_1(14) = Coordinate(0.to[Int16], 0.to[Int16])
+        descriptor_coord_1(15) = Coordinate(0.to[Int16], 6.to[Int16])
+      }
+
+      val descriptor_coord_2 = RegFile[Coordinate](16)
+      Pipe{
+        descriptor_coord_2(0) = Coordinate(0.to[Int16], 6.to[Int16])
+        descriptor_coord_2(1) = Coordinate(1.to[Int16], 6.to[Int16])
+        descriptor_coord_2(2) = Coordinate(2.to[Int16], 6.to[Int16])
+        descriptor_coord_2(3) = Coordinate(3.to[Int16], 6.to[Int16])
+        descriptor_coord_2(4) = Coordinate(4.to[Int16], 6.to[Int16])
+        descriptor_coord_2(5) = Coordinate(5.to[Int16], 6.to[Int16])
+        descriptor_coord_2(6) = Coordinate(5.to[Int16], 6.to[Int16])
+
+        descriptor_coord_2(7) = Coordinate(6.to[Int16], 0.to[Int16])
+        descriptor_coord_2(8) = Coordinate(6.to[Int16], 1.to[Int16])
+        descriptor_coord_2(9) = Coordinate(6.to[Int16], 2.to[Int16])
+        descriptor_coord_2(10) = Coordinate(6.to[Int16], 3.to[Int16])
+        descriptor_coord_2(11) = Coordinate(6.to[Int16], 4.to[Int16])
+        descriptor_coord_2(12) = Coordinate(6.to[Int16], 5.to[Int16])
+        descriptor_coord_2(13) = Coordinate(6.to[Int16], 6.to[Int16])
+
+        descriptor_coord_2(14) = Coordinate(6.to[Int16], 0.to[Int16])
+        descriptor_coord_2(15) = Coordinate(6.to[Int16], 6.to[Int16])
+      }
+
       val sr = RegFile[Int16](sr_height, sr_width)
       val fifoIn = FIFO[Int16](C)
       val fifoOut = FIFO[Int16](C)
       val lb = LineBuffer[Int16](lb_height, lb_width)
+
+      val lastDescriptor = RegFile[UInt1](16)
 
       // val row = 0
       // val col = 0
@@ -104,21 +152,40 @@ object VideoStabilization extends SpatialApp {
             Foreach(0 until 16){ i =>
               val ring_pixel = sr_coord(i)
               val ring_pixel_val = sr(ring_pixel.x.to[Index], ring_pixel.y.to[Index])
+              // println(ring_pixel_val)
               // if (r == 113 && c == 77) {
               //   println(ring_pixel_val)
               // }
+              // println(ring_pixel_val + " " + (grayscale_pixel + t))
+              // println(ring_pixel_val > (grayscale_pixel + t))
               Sequential {
-                if (ring_pixel_val < grayscale_pixel - t) {
+                ring_values(i) = 0
+                ring_values(i+16) = 0
+                if (ring_pixel_val < (grayscale_pixel - t)) {
                     ring_values(i) = -1
                     ring_values(i+16) = -1
-                } else if (ring_pixel_val > grayscale_pixel + t) {
+                }
+                if (ring_pixel_val > (grayscale_pixel + t)) {
                     ring_values(i) = 1
                     ring_values(i+16) = 1
-                } else {
-                    ring_values(i) = 0
-                    ring_values(i+16) = 0
                 }
               }
+            }
+
+            val brief_descriptor = RegFile[UInt1](16)
+            Foreach(0 until 16){ i =>
+              Sequential {
+                val pt1 = descriptor_coord_1(i)
+                val pt2 = descriptor_coord_2(i)
+                brief_descriptor(i) = 0.to[UInt1]
+                if (sr(pt1.x.to[Index], pt1.y.to[Index]) > sr(pt2.x.to[Index], pt2.y.to[Index])) {
+                  brief_descriptor(i) = 1.to[UInt1]
+                }
+              }
+            }
+            // Do some stuff
+            Foreach(0 until 16){ i =>
+              lastDescriptor(i) := brief_descriptor(i)
             }
 
             // Figure out if 12 continguous values below or above threshold
@@ -135,13 +202,14 @@ object VideoStabilization extends SpatialApp {
 
               if (running_count.value == 12.to[Int16] && curr.value != 0.to[Int16]) {
                   is_feature := 1
-                  println(r + " " + c + " " + ring_values(0) + " " + ring_values(1) + " " +
-                    ring_values(2) + " " + ring_values(3) + " " + ring_values(4) + " " +
-                    ring_values(5) + " " + ring_values(6) + " " + ring_values(7) + " " +
-                    ring_values(8) + " " + ring_values(9) + " " + ring_values(10) + " " +
-                    ring_values(11) + " " + ring_values(12) + " " + ring_values(13) + " " +
-                    ring_values(14) + " " + ring_values(15))
-                  println(" grayscale " + grayscale_pixel)
+                  println(r + " " + c)
+                  // println(r + " " + c + " " + ring_values(0) + " " + ring_values(1) + " " +
+                  //   ring_values(2) + " " + ring_values(3) + " " + ring_values(4) + " " +
+                  //   ring_values(5) + " " + ring_values(6) + " " + ring_values(7) + " " +
+                  //   ring_values(8) + " " + ring_values(9) + " " + ring_values(10) + " " +
+                  //   ring_values(11) + " " + ring_values(12) + " " + ring_values(13) + " " +
+                  //   ring_values(14) + " " + ring_values(15))
+                  // println(" grayscale " + grayscale_pixel + " " + (grayscale_pixel + t))
                   // TODO: does Spatial have break statement?
               }
             }
@@ -152,7 +220,7 @@ object VideoStabilization extends SpatialApp {
             //   fifoOut.enq(grayscale_pixel)
             // }
 
-            fifoOut.enq(mux[Int16](is_feature.value == 1.to[Int16], 255, grayscale_pixel))
+            fifoOut.enq(mux[Int16]((is_feature.value == 1.to[Int16]) && (r > 4.to[Index]), 255, grayscale_pixel))
           }
         }
         
