@@ -31,7 +31,7 @@ object VideoStabilization extends SpatialApp {
   @virtualize
   def detect_FAST(): Unit = {
     val imgIn  = StreamIn[Pixel24](target.VideoCamera)  // TODO: change back to Pixel16
-    val imgIn2  = StreamIn[Pixel24](target.VideoCamera)  // TODO: change back to Pixel16
+    // val imgIn2  = StreamIn[Pixel24](target.VideoCamera)  // TODO: change back to Pixel16
     val imgOut = StreamOut[Pixel24](target.VGA)
     // val imgOut = StreamOut[Pixel16](target.VGA)
 
@@ -105,7 +105,10 @@ object VideoStabilization extends SpatialApp {
       val fifoOut = FIFO[Int16](C)
       val lb = LineBuffer[Int16](lb_height, lb_width)
 
-      val lastDescriptor = RegFile[UInt1](16)
+      val fifoDescriptor = FIFO[UInt1](16000)
+      val numDescriptors = Reg[Int16](0)
+
+      // val lastDescriptor = RegFile[UInt1](16)
 
       // val row = 0
       // val col = 0
@@ -172,22 +175,6 @@ object VideoStabilization extends SpatialApp {
               }
             }
 
-            val brief_descriptor = RegFile[UInt1](16)
-            Foreach(0 until 16){ i =>
-              Sequential {
-                val pt1 = descriptor_coord_1(i)
-                val pt2 = descriptor_coord_2(i)
-                brief_descriptor(i) = 0.to[UInt1]
-                if (sr(pt1.x.to[Index], pt1.y.to[Index]) > sr(pt2.x.to[Index], pt2.y.to[Index])) {
-                  brief_descriptor(i) = 1.to[UInt1]
-                }
-              }
-            }
-            // Do some stuff
-            Foreach(0 until 16){ i =>
-              lastDescriptor(i) := brief_descriptor(i)
-            }
-
             // Figure out if 12 continguous values below or above threshold
             running_count := 1
             curr := ring_values(0)
@@ -219,6 +206,34 @@ object VideoStabilization extends SpatialApp {
             // } else {
             //   fifoOut.enq(grayscale_pixel)
             // }
+
+            // There's a problem somewhere in the first Foreach loop:
+            // Internal exception #1005: Access x2404 had no dispatch information for memory x2403
+            if ((is_feature.value == 1.to[Int16]) && (r > 4.to[Index])) {
+              val brief_descriptor = RegFile[UInt1](16)
+              Foreach(0 until 16){ i =>
+                Sequential {
+                  val pt1 = descriptor_coord_1(i)
+                  val pt2 = descriptor_coord_2(i)
+                  brief_descriptor(i) = 0.to[UInt1]
+                  if (sr(pt1.x.to[Index], pt1.y.to[Index]) > sr(pt2.x.to[Index], pt2.y.to[Index])) {
+                    brief_descriptor(i) = 1.to[UInt1]
+                  }
+                }
+              }
+              // println(brief_descriptor(0) + " " + brief_descriptor(1) + " " +
+              //         brief_descriptor(2) + " " + brief_descriptor(3) + " " + brief_descriptor(4) + " " +
+              //         brief_descriptor(5) + " " + brief_descriptor(6) + " " + brief_descriptor(7) + " " +
+              //         brief_descriptor(8) + " " + brief_descriptor(9) + " " + brief_descriptor(10) + " " +
+              //         brief_descriptor(11) + " " + brief_descriptor(12) + " " + brief_descriptor(13) + " " +
+              //         brief_descriptor(14) + " " + brief_descriptor(15))
+              // Do some stuff
+              Foreach(0 until 16){ i =>
+                fifoDescriptor.enq(brief_descriptor(i))
+                // lastDescriptor(i) = brief_descriptor(i)
+              }
+              numDescriptors := numDescriptors.value + 1
+            }
 
             fifoOut.enq(mux[Int16]((is_feature.value == 1.to[Int16]) && (r > 4.to[Index]), 255, grayscale_pixel))
           }
