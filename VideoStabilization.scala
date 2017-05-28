@@ -28,6 +28,7 @@ object VideoStabilization extends SpatialApp {
   @struct case class Pixel16(b: UInt5, g: UInt6, r: UInt5)
 
   @struct case class Coordinate(x: Int16, y: Int16)
+  @struct case class Match(x1: UInt10, y1: UInt10, x2: UInt10, y2: UInt10)
 
   @virtualize
   def detect_FAST(): Unit = {
@@ -111,6 +112,9 @@ object VideoStabilization extends SpatialApp {
       // val fifoDescriptor2 = FIFO[UInt1](3200)
       val fifo_prev_descriptors = FIFO[UInt1](3200)
       val fifo_curr_descriptors = FIFO[UInt1](3200)
+      val fifo_prev_coord = FIFO[Coordinate](200)
+      val fifo_curr_coord = FIFO[Coordinate](200)
+      val matches = FIFO[Match](200)
 
       val numDescriptors = Reg[Int16](0)
       val numDescriptorsPrev = Reg[Int16](0)
@@ -127,6 +131,13 @@ object VideoStabilization extends SpatialApp {
       val hamming_distance = Reg[Int16](0)
       val min_hamming_distance = Reg[Int16](0)
       val second_min_hamming_distance = Reg[Int16](0)
+      val best_match_coord = Reg[Coordinate]
+
+      // for calculating affine transform
+      val prev_points = SRAM[UInt10](3, 3)
+      val curr_points = SRAM[UInt10](2, 3)
+      val prev_points_inv = SRAM[UInt10](3, 3)
+      val M = SRAM[UInt10](2, 3)
 
       frame_counter := 0
 
@@ -268,13 +279,19 @@ object VideoStabilization extends SpatialApp {
                 if (hamming_distance.value < min_hamming_distance.value) {
                   second_min_hamming_distance := min_hamming_distance.value
                   min_hamming_distance := hamming_distance.value
+                  best_match_coord := fifo_prev_coord.deq()
+                  fifo_prev_coord.enq(best_match_coord.value)
                 } else if (hamming_distance.value < second_min_hamming_distance.value) {
                   second_min_hamming_distance := hamming_distance.value
+                  fifo_prev_coord.enq(fifo_prev_coord.deq())
+                } else {
+                  fifo_prev_coord.enq(fifo_prev_coord.deq())
                 }
               }
               // TODO: add distance and orientation checks from IEEE paper
               if (min_hamming_distance.value.to[Float] / second_min_hamming_distance.value.to[Float] > hamming_threshold) {
-                // TODO: do something with match
+                // it's a match
+                matches.enq(Match(x1=best_match_coord.value.x.to[UInt10], y1=best_match_coord.value.y.to[UInt10], x2=c.to[UInt10], y2=r.to[UInt10]))
               }
 
               // // alternate matching scheme
@@ -313,6 +330,7 @@ object VideoStabilization extends SpatialApp {
               Foreach(0 until 16){ i =>
                 fifo_curr_descriptors.enq(brief_descriptor(i))
               }
+              fifo_curr_coord.enq(Coordinate(c.to[Int16], r.to[Int16]))
               numDescriptors := numDescriptors.value + 1
             }
 
@@ -332,6 +350,61 @@ object VideoStabilization extends SpatialApp {
                 val bit = fifo_curr_descriptors.deq()
                 fifo_prev_descriptors.enq(bit)
               }
+
+              Foreach(0 until fifo_prev_coord.numel()){ _ =>
+                fifo_prev_coord.deq()
+              }
+              Foreach(0 until fifo_curr_coord.numel()){ _ =>
+                fifo_prev_coord.enq(fifo_curr_coord.deq())
+              }
+
+              Foreach(0 until matches.numel() / 3){ _ =>
+                Sequential {
+                  val match1 = matches.deq()
+                  val match2 = matches.deq()
+                  val match3 = matches.deq()
+
+                  prev_points(0, 0) = match1.x1
+                  prev_points(0, 1) = match2.x1
+                  prev_points(0, 2) = match3.x1
+                  prev_points(1, 0) = match1.y1
+                  prev_points(1, 1) = match2.y1
+                  prev_points(1, 2) = match3.y1
+                  prev_points(2, 0) = 1
+                  prev_points(2, 1) = 1
+                  prev_points(2, 2) = 1
+
+                  curr_points(0, 0) = match1.x2
+                  curr_points(0, 1) = match2.x2
+                  curr_points(0, 2) = match3.x2
+                  curr_points(1, 0) = match1.y2
+                  curr_points(1, 1) = match2.y2
+                  curr_points(1, 2) = match3.y2
+
+                  val det = prev_points(0, 0) * (prev_points(1, 1) * prev_points(2, 2) - prev_points(2, 1) * prev_points(1, 2)) -
+                    prev_points(0, 1) * (prev_points(1, 0) * prev_points(2, 2) - prev_points(1, 2) * prev_points(2, 0)) +
+                    prev_points(0, 2) * (prev_points(1, 0) * prev_points(2, 1) - prev_points(1, 1) * prev_points(2, 0))
+                  val invdet = 1/det
+                  prev_points_inv(0, 0) = (prev_points(1, 1) * prev_points(2, 2) - prev_points(2, 1) * prev_points(1, 2)) * invdet;
+                  prev_points_inv(0, 1) = (prev_points(0, 2) * prev_points(2, 1) - prev_points(0, 1) * prev_points(2, 2)) * invdet;
+                  prev_points_inv(0, 2) = (prev_points(0, 1) * prev_points(1, 2) - prev_points(0, 2) * prev_points(1, 1)) * invdet;
+                  prev_points_inv(1, 0) = (prev_points(1, 2) * prev_points(2, 0) - prev_points(1, 0) * prev_points(2, 2)) * invdet;
+                  prev_points_inv(1, 1) = (prev_points(0, 0) * prev_points(2, 2) - prev_points(0, 2) * prev_points(2, 0)) * invdet;
+                  prev_points_inv(1, 2) = (prev_points(1, 0) * prev_points(0, 2) - prev_points(0, 0) * prev_points(1, 2)) * invdet;
+                  prev_points_inv(2, 0) = (prev_points(1, 0) * prev_points(2, 1) - prev_points(2, 0) * prev_points(1, 1)) * invdet;
+                  prev_points_inv(2, 1) = (prev_points(2, 0) * prev_points(0, 1) - prev_points(0, 0) * prev_points(2, 1)) * invdet;
+                  prev_points_inv(2, 2) = (prev_points(0, 0) * prev_points(1, 1) - prev_points(1, 0) * prev_points(0, 1)) * invdet;
+
+                  M(0, 0) = curr_points(0,0)*prev_points_inv(0,0) + curr_points(0,1)*prev_points_inv(1,0) + curr_points(0,2)*prev_points_inv(2,0)
+                  M(0, 1) = curr_points(0,0)*prev_points_inv(0,1) + curr_points(0,1)*prev_points_inv(1,1) + curr_points(0,2)*prev_points_inv(2,1)
+                  M(0, 2) = curr_points(0,0)*prev_points_inv(0,2) + curr_points(0,1)*prev_points_inv(1,2) + curr_points(0,2)*prev_points_inv(2,2)
+                  M(1, 0) = curr_points(1,0)*prev_points_inv(0,0) + curr_points(1,1)*prev_points_inv(1,0) + curr_points(1,2)*prev_points_inv(2,0)
+                  M(1, 1) = curr_points(1,0)*prev_points_inv(0,1) + curr_points(1,1)*prev_points_inv(1,1) + curr_points(1,2)*prev_points_inv(2,1)
+                  M(1, 2) = curr_points(1,0)*prev_points_inv(0,2) + curr_points(1,1)*prev_points_inv(1,2) + curr_points(1,2)*prev_points_inv(2,2)
+                }
+              }
+
+              // TODO: select best transformtion with RANSAC
             }
 
             // val pixel_value = fifoOut.deq()
