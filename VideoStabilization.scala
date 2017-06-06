@@ -7,7 +7,7 @@ object VideoStabilization extends SpatialApp {
 
   override val target = DE1
 
-  val R = 128  // FIXME
+  val R = 16  // FIXME
   val C = 128  // FIXME
   val t = 50.to[Int16]  // FIXME
   val n = 12
@@ -107,8 +107,8 @@ object VideoStabilization extends SpatialApp {
 
       val sr = RegFile[Int16](sr_height, sr_width)
       val fifoIn = FIFO[Int16](C)
-      val fifoOut = FIFO[Int16](C)
-      val lb = LineBuffer[Int16](lb_height, lb_width)
+      // val fifoOut = FIFO[Int16](C)
+      val lb = LineBuffer[Int16](lb_height, C)
 
       // val fifoDescriptor1 = FIFO[UInt1](3200)
       // val fifoDescriptor2 = FIFO[UInt1](3200)
@@ -116,7 +116,9 @@ object VideoStabilization extends SpatialApp {
       val fifo_curr_descriptors = FIFO[UInt1](3200)
       val fifo_prev_coord = FIFO[Coordinate](200)
       val fifo_curr_coord = FIFO[Coordinate](200)
-      val matches = FIFO[Match](200)
+      // val matches = FIFO[Match](200)
+      val matches = SRAM[Match](300)
+      val num_matches = Reg[Int](0)
 
       val numDescriptors = Reg[Int16](0)
       val numDescriptorsPrev = Reg[Int16](0)
@@ -128,379 +130,433 @@ object VideoStabilization extends SpatialApp {
 
       val curr = Reg[Int16](0)
       val is_feature = Reg[Int16](0)
-      val running_count = Reg[Int16](0)
+      val running_count = Reg[Int16](1)
       val frame_counter = Reg[UInt1](0)
-      val is_first_frame = Reg[UInt1](0)
+      val is_first_frame = Reg[UInt1](1)
       val hamming_distance = Reg[Int16](0)
-      val min_hamming_distance = Reg[Int16](0)
-      val second_min_hamming_distance = Reg[Int16](0)
+      val min_hamming_distance = Reg[Int16](16)
+      val second_min_hamming_distance = Reg[Int16](16)
       val best_match_coord = Reg[Coordinate]
 
       // for calculating affine transform
-      val prev_points = SRAM[UInt10](3, 3)
+      val prev_points = SRAM[Float](3, 3)
       // val curr_points = SRAM[UInt10](2, 3)
-      val curr_points = SRAM[UInt10](3, 3)
+      val curr_points = SRAM[Float](3, 3)
       // val prev_points_inv = SRAM[UInt10](3, 3)
-      val curr_points_inv = SRAM[UInt10](3, 3)
-      val M = SRAM[UInt10](2, 3)
-      val best_geo_distance = Reg[Float](0)
-      val cumulative_M = SRAM[UInt10](2, 3)
+      val curr_points_inv = SRAM[Float](3, 3)
+      val M = SRAM[Float](2, 3)
+      val best_geo_distance = Reg[Float](10000)
+      val cumulative_M = SRAM[Float](2, 3)
       Sequential {
-        cumulative_M(0, 0) = 1.to[UInt10]
-        cumulative_M(1, 1) = 1.to[UInt10]
+        cumulative_M(0, 0) = 1.to[Float]
+        cumulative_M(0, 1) = 0.to[Float]
+        cumulative_M(0, 2) = 0.to[Float]
+        cumulative_M(1, 0) = 0.to[Float]
+        cumulative_M(1, 1) = 1.to[Float]
+        cumulative_M(1, 2) = 0.to[Float]
       }
 
-      frame_counter := 0
-      is_first_frame := 1 // TODO: change back
+      // frame_counter := 0
+      frame_counter.reset
+      is_first_frame.reset // 1
 
-      println("Start of stream")
+      // println("Start of stream")
 
       Stream(*) { _ =>
-        val pixel = imgIn.value()
-        val grayscale_pixel = (pixel.b.to[Int16] + pixel.g.to[Int16] + pixel.r.to[Int16]) / 3
-        fifoIn.enq(grayscale_pixel)
+        // val pixel = imgIn.value()
+        // // TODO: fix this if using Pixel16 as input
+        // val grayscale_pixel = (pixel.b.to[Int16]*8 + pixel.g.to[Int16]*4 + pixel.r.to[Int16]*8) / 3
+        // // println(grayscale_pixel)
+        // fifoIn.enq(grayscale_pixel)
 
-        // if (col == 639) {
-        //  col = 0
-        //  if (row == 479) {
-        //      row = 0
-        //  } else {
-        //      row = row + 1
-        //  }
-        // } else {
-        //  col = col + 1
-        // }
-
-        Foreach(0 until R, 0 until C){ (r, c) => 
-          Sequential {
-            println("loop " + r + " " + c)
-            val grayscale_pixel = fifoIn.deq()
-            lb.enq(grayscale_pixel)
-            Foreach(0 until sr_height){ i =>
-              sr(i, *) <<= lb(i, c)
-            }
-
-            // println("row " + r + " col " + c + " grayscale " + grayscale_pixel)
-
-            val ring_values = RegFile[Int16](32)
-
-            Foreach(0 until 16){ i =>
-              val ring_pixel = sr_coord(i)
-              val ring_pixel_val = sr(ring_pixel.x.to[Index], ring_pixel.y.to[Index])
-              // println(ring_pixel_val)
-              // if (r == 113 && c == 77) {
-              //   println(ring_pixel_val)
-              // }
-              // println(ring_pixel_val + " " + (grayscale_pixel + t))
-              // println(ring_pixel_val > (grayscale_pixel + t))
-              Sequential {
-                ring_values(i) = 0
-                ring_values(i+16) = 0
-                if (ring_pixel_val < (grayscale_pixel - t)) {
-                    ring_values(i) = -1
-                    ring_values(i+16) = -1
-                }
-                if (ring_pixel_val > (grayscale_pixel + t)) {
-                    ring_values(i) = 1
-                    ring_values(i+16) = 1
-                }
-              }
-            }
-
-            // Figure out if 12 contiguous values below or above threshold
-            running_count := 1
-            curr := ring_values(0)
-            is_feature := 0
-            Foreach(1 until 32){ i =>
-              if (ring_values(i) == curr.value) {
-                  running_count := running_count.value + 1
-              } else {
-                  running_count := 1
-                  curr := ring_values(i)
+        Sequential.Foreach(0 until R){ r => 
+          Sequential.Foreach(0 until C) { _ => 
+            Sequential {
+              val pixel = imgIn.value()
+              val grayscale_pixel = (pixel.b.to[Int16]*8 + pixel.g.to[Int16]*4 + pixel.r.to[Int16]*8) / 3
+              fifoIn.enq(grayscale_pixel)
+              lb.enq(grayscale_pixel)
+            } 
+          }
+          Sequential.Foreach(0 until C) { c =>
+            Sequential {
+              // println("loop " + r + " " + c)
+              val grayscale_pixel = fifoIn.deq()
+              Foreach(0 until sr_height){ i =>
+                sr(i, *) <<= lb(i, c)
               }
 
-              if (running_count.value == 12.to[Int16] && curr.value != 0.to[Int16]) {
-                  is_feature := 1
-                  // println(r + " " + c)
-              }
-            }
+              // println("row " + r + " col " + c + " grayscale " + grayscale_pixel)
 
-            if ((is_feature.value == 1.to[Int16]) && (r > 4.to[Index])) {
-              val brief_descriptor = RegFile[UInt1](16)
-              Foreach(0 until 16){ i =>
+              val ring_values = RegFile[Int16](32)
+
+              Sequential.Foreach(0 until 16){ i =>
+                val ring_pixel = sr_coord(i)
+                val ring_pixel_val = sr(ring_pixel.x.to[Index], ring_pixel.y.to[Index])
+                // println(ring_pixel_val)
+                // if (r == 113 && c == 77) {
+                //   println(ring_pixel_val)
+                // }
+                // println(ring_pixel_val + " " + (grayscale_pixel + t))
+                // println(ring_pixel_val > (grayscale_pixel + t))
                 Sequential {
-                  val pt1 = descriptor_coord_1(i)
-                  val pt2 = descriptor_coord_2(i)
-                  brief_descriptor(i) = 0.to[UInt1]
-                  if (sr(pt1.x.to[Index], pt1.y.to[Index]) > sr(pt2.x.to[Index], pt2.y.to[Index])) {
-                    brief_descriptor(i) = 1.to[UInt1]
+                  ring_values(i) = 0
+                  ring_values(i+16) = 0
+                  if (ring_pixel_val < (grayscale_pixel - t)) {
+                      ring_values(i) = -1
+                      ring_values(i+16) = -1
+                  }
+                  if (ring_pixel_val > (grayscale_pixel + t)) {
+                      ring_values(i) = 1
+                      ring_values(i+16) = 1
                   }
                 }
               }
-              // println(brief_descriptor(0) + " " + brief_descriptor(1) + " " +
-              //         brief_descriptor(2) + " " + brief_descriptor(3) + " " + brief_descriptor(4) + " " +
-              //         brief_descriptor(5) + " " + brief_descriptor(6) + " " + brief_descriptor(7) + " " +
-              //         brief_descriptor(8) + " " + brief_descriptor(9) + " " + brief_descriptor(10) + " " +
-              //         brief_descriptor(11) + " " + brief_descriptor(12) + " " + brief_descriptor(13) + " " +
-              //         brief_descriptor(14) + " " + brief_descriptor(15))
-              
-              // val curr_fifo = mux[FIFO[UInt1]](frame_counter.value == 0.to[UInt1], fifoDescriptor1, fifoDescriptor2)
-              // val prev_fifo = mux[FIFO[UInt1]](frame_counter.value == 0.to[UInt1], fifoDescriptor2, fifoDescriptor1)
 
-              // if (frame_counter.value == 0.to[UInt1]) {
-              //   curr_fifo := fifoDescriptor1
-              // } else {
-              //   prev_fifo := fifoDescriptor2
-              // }
-
-              if (is_first_frame.value.to[Int] == 0) {
-                // match with descriptors from previous frame
-                min_hamming_distance := 16
-                second_min_hamming_distance := 16
-                Foreach(0 until numDescriptorsPrev.value.to[Index]){ i =>
-                  hamming_distance := 0
-                  // Foreach(0 until 16){ j =>
-                  //   val bit = prev_fifo.deq()
-                  //   if (bit != brief_descriptor(j)) {
-                  //     hamming_distance := hamming_distance.value + 1
-                  //   }
-                  //   prev_fifo.enq(bit)
-                  // }
-                  // if (frame_counter.value == 0.to[UInt1]) {
-                  //   Foreach(0 until 16){ j =>
-                  //     val bit = fifoDescriptor2.deq()
-                  //     if (bit != brief_descriptor(j)) {
-                  //       hamming_distance := hamming_distance.value + 1
-                  //     }
-                  //     fifoDescriptor2.enq(bit, frame_counter.value == 0.to[UInt1])
-                  //   }
-                  // } else {
-                  //   Foreach(0 until 16){ j =>
-                  //     val bit = fifoDescriptor1.deq()
-                  //     if (bit != brief_descriptor(j)) {
-                  //       hamming_distance := hamming_distance.value + 1
-                  //     }
-                  //     fifoDescriptor1.enq(bit, frame_counter.value == 1.to[UInt1])
-                  //   }
-                  // }
-                  Foreach(0 until 16){ j =>
-                    val bit = fifo_prev_descriptors.deq()
-                    if (bit != brief_descriptor(j)) {
-                      hamming_distance := hamming_distance.value + 1
-                    }
-                    fifo_prev_descriptors.enq(bit)
-                  }
-                  if (hamming_distance.value < min_hamming_distance.value) {
-                    second_min_hamming_distance := min_hamming_distance.value
-                    min_hamming_distance := hamming_distance.value
-                    best_match_coord := fifo_prev_coord.deq()
-                    fifo_prev_coord.enq(best_match_coord.value)
-                  } else if (hamming_distance.value < second_min_hamming_distance.value) {
-                    second_min_hamming_distance := hamming_distance.value
-                    fifo_prev_coord.enq(fifo_prev_coord.deq())
-                  } else {
-                    fifo_prev_coord.enq(fifo_prev_coord.deq())
-                  }
-                }
-                // TODO: add distance and orientation checks from IEEE paper
-                if (min_hamming_distance.value.to[Float] / second_min_hamming_distance.value.to[Float] <= hamming_threshold) {
-                  // it's a match
-                  // println(min_hamming_distance.value.to[Float] + " " + second_min_hamming_distance.value.to[Float])
-                  matches.enq(Match(x1=best_match_coord.value.x.to[UInt10], y1=best_match_coord.value.y.to[UInt10], x2=c.to[UInt10], y2=r.to[UInt10]))
+              // Figure out if 12 contiguous values below or above threshold
+              running_count.reset  // 1
+              curr := ring_values(0)
+              is_feature.reset  // 0
+              Sequential.Foreach(1 until 32){ i =>
+                if (ring_values(i) == curr.value) {
+                    running_count := running_count.value + 1
+                } else {
+                    running_count.reset  // 1
+                    curr := ring_values(i)
                 }
 
-                // // alternate matching scheme
-                // Foreach(0 until numDescriptorsPrev){ i =>
-                //   hamming_distance := 0
-                //   if (frame_counter.value == 0) {
-                //     Foreach(0 until 16){ j =>
-                //       val bit = fifoDescriptor2.deq()
-                //       if (bit != brief_descriptor(j)) {
-                //         hamming_distance := hamming_distance.value + 1
-                //       }
-                //       fifoDescriptor2.enq(bit)
-                //     }
-                //   } else {
-                //     Foreach(0 until 16){ j =>
-                //       val bit = fifoDescriptor1.deq()
-                //       if (bit != brief_descriptor(j)) {
-                //         hamming_distance := hamming_distance.value + 1
-                //       }
-                //       fifoDescriptor1.enq(bit)
-                //     }
-                //   }
-                //   if (hamming_distance.value < 12) {
-                //     // TODO: do something with match
-                //   }
-                // }
-
-                // enqueue the current descriptor
-                // Foreach(0 until 16){ i =>
-                //   if (frame_counter.value == 0.to[UInt1]) {
-                //     fifoDescriptor1.enq(brief_descriptor(i), frame_counter.value == 0.to[UInt1])
-                //   } else {
-                //     fifoDescriptor2.enq(brief_descriptor(i), frame_counter.value == 1.to[UInt1])
-                //   }
-                // }
-              }
-              Foreach(0 until 16){ i =>
-                fifo_curr_descriptors.enq(brief_descriptor(i))
-              }
-              fifo_curr_coord.enq(Coordinate(c.to[Int16], r.to[Int16]))
-              numDescriptors := numDescriptors.value + 1
-            }
-
-            // For debug purposes
-            fifoOut.enq(mux[Int16]((is_feature.value == 1.to[Int16]) && (r > 4.to[Index]), 255, grayscale_pixel))
-            
-            // end of frame updates
-            if (r == R-1 && c == C-1) {
-              println("end of frame updates")
-              frame_counter := mux[UInt1](frame_counter == 0.to[UInt1], 1, 0)
-              numDescriptorsPrev := numDescriptors.value
-              numDescriptors := 0
-
-              // println(fifo_prev_descriptors.numel())
-              Foreach(0 until fifo_prev_descriptors.numel()){ i =>
-                fifo_prev_descriptors.deq()
-              }
-              // println(fifo_curr_descriptors.numel())
-              Foreach(0 until fifo_curr_descriptors.numel()){ i =>
-                val bit = fifo_curr_descriptors.deq()
-                fifo_prev_descriptors.enq(bit)
-              }
-              // println(fifo_prev_coord.numel())
-              Foreach(0 until fifo_prev_coord.numel()){ _ =>
-                fifo_prev_coord.deq()
-              }
-              // println(fifo_curr_coord.numel())
-              Foreach(0 until fifo_curr_coord.numel()){ _ =>
-                fifo_prev_coord.enq(fifo_curr_coord.deq())
+                if (running_count.value == 12.to[Int16] && curr.value != 0.to[Int16]) {
+                    is_feature := 1
+                    // println(r + " " + c)
+                }
               }
 
-              println(matches.numel())
-
-              println("start matches")
-              if (is_first_frame.value.to[Int] == 0) {
-                // println(matches.numel() / 3)
-                best_geo_distance := 10000
-                Foreach(0 until matches.numel() / 3){ i =>
-                  println("3-match " + i)
+              if ((is_feature.value == 1.to[Int16]) && (r > 4.to[Index]) && numDescriptors.value < 200) {
+                // println("add feature")
+                val brief_descriptor = RegFile[UInt1](16)
+                Sequential.Foreach(0 until 16){ i =>
                   Sequential {
-                    val match1 = matches.deq()
-                    val match2 = matches.deq()
-                    val match3 = matches.deq()
-
-                    // Use Heron's formula to calculate the difference in areas between triangles
-                    val shoelace_prev = 0.5 * ((match1.x1 - match3.x1)*(match2.y1 - match1.y1) -
-                      (match1.x1 - match2.x1)*(match3.y1 - match1.y1)).to[Float]
-                    val area_prev = mux[Float](shoelace_prev >= 0, shoelace_prev, -1 * shoelace_prev)
-                    val shoelace_curr = 0.5 * ((match1.x2 - match3.x2)*(match2.y2 - match1.y2) -
-                      (match1.x2 - match2.x2)*(match3.y2 - match1.y2)).to[Float]
-                    val area_curr = mux[Float](shoelace_curr >= 0, shoelace_curr, -1 * shoelace_curr)
-                    val area_diff = area_curr - area_prev
-                    val geo_distance = mux[Float](area_diff >= 0, area_diff, -1 * area_diff)
-                    
-                    if (geo_distance < best_geo_distance) {
-                      best_geo_distance := geo_distance
-                      prev_points(0, 0) = match1.x1
-                      prev_points(0, 1) = match2.x1
-                      prev_points(0, 2) = match3.x1
-                      prev_points(1, 0) = match1.y1
-                      prev_points(1, 1) = match2.y1
-                      prev_points(1, 2) = match3.y1
-                      prev_points(2, 0) = 1
-                      prev_points(2, 1) = 1
-                      prev_points(2, 2) = 1
-
-                      curr_points(0, 0) = match1.x2
-                      curr_points(0, 1) = match2.x2
-                      curr_points(0, 2) = match3.x2
-                      curr_points(1, 0) = match1.y2
-                      curr_points(1, 1) = match2.y2
-                      curr_points(1, 2) = match3.y2
-                      curr_points(2, 0) = 1
-                      curr_points(2, 1) = 1
-                      curr_points(2, 2) = 1
-
-                      // val det = prev_points(0, 0) * (prev_points(1, 1) * prev_points(2, 2) - prev_points(2, 1) * prev_points(1, 2)) -
-                      //   prev_points(0, 1) * (prev_points(1, 0) * prev_points(2, 2) - prev_points(1, 2) * prev_points(2, 0)) +
-                      //   prev_points(0, 2) * (prev_points(1, 0) * prev_points(2, 1) - prev_points(1, 1) * prev_points(2, 0))
-                      val det = curr_points(0, 0) * (curr_points(1, 1) * curr_points(2, 2) - curr_points(2, 1) * curr_points(1, 2)) -
-                        curr_points(0, 1) * (curr_points(1, 0) * curr_points(2, 2) - curr_points(1, 2) * curr_points(2, 0)) +
-                        curr_points(0, 2) * (curr_points(1, 0) * curr_points(2, 1) - curr_points(1, 1) * curr_points(2, 0))
-                      
-                      // println(det)
-                      // println(det.to[Int] != 0)
-                      // println("before if statement")
-                      if (det.to[Int] != 0) {
-                        val invdet = 1/det
-                        curr_points_inv(0, 0) = (curr_points(1, 1) * curr_points(2, 2) - curr_points(2, 1) * curr_points(1, 2)) * invdet;
-                        curr_points_inv(0, 1) = (curr_points(0, 2) * curr_points(2, 1) - curr_points(0, 1) * curr_points(2, 2)) * invdet;
-                        curr_points_inv(0, 2) = (curr_points(0, 1) * curr_points(1, 2) - curr_points(0, 2) * curr_points(1, 1)) * invdet;
-                        curr_points_inv(1, 0) = (curr_points(1, 2) * curr_points(2, 0) - curr_points(1, 0) * curr_points(2, 2)) * invdet;
-                        curr_points_inv(1, 1) = (curr_points(0, 0) * curr_points(2, 2) - curr_points(0, 2) * curr_points(2, 0)) * invdet;
-                        curr_points_inv(1, 2) = (curr_points(1, 0) * curr_points(0, 2) - curr_points(0, 0) * curr_points(1, 2)) * invdet;
-                        curr_points_inv(2, 0) = (curr_points(1, 0) * curr_points(2, 1) - curr_points(2, 0) * curr_points(1, 1)) * invdet;
-                        curr_points_inv(2, 1) = (curr_points(2, 0) * curr_points(0, 1) - curr_points(0, 0) * curr_points(2, 1)) * invdet;
-                        curr_points_inv(2, 2) = (curr_points(0, 0) * curr_points(1, 1) - curr_points(1, 0) * curr_points(0, 1)) * invdet;
-
-                        // M is the affine transfrom from curr_points to prev_points
-                        M(0, 0) = prev_points(0,0)*curr_points_inv(0,0) + prev_points(0,1)*curr_points_inv(1,0) + prev_points(0,2)*curr_points_inv(2,0)
-                        M(0, 1) = prev_points(0,0)*curr_points_inv(0,1) + prev_points(0,1)*curr_points_inv(1,1) + prev_points(0,2)*curr_points_inv(2,1)
-                        M(0, 2) = prev_points(0,0)*curr_points_inv(0,2) + prev_points(0,1)*curr_points_inv(1,2) + prev_points(0,2)*curr_points_inv(2,2)
-                        M(1, 0) = prev_points(1,0)*curr_points_inv(0,0) + prev_points(1,1)*curr_points_inv(1,0) + prev_points(1,2)*curr_points_inv(2,0)
-                        M(1, 1) = prev_points(1,0)*curr_points_inv(0,1) + prev_points(1,1)*curr_points_inv(1,1) + prev_points(1,2)*curr_points_inv(2,1)
-                        M(1, 2) = prev_points(1,0)*curr_points_inv(0,2) + prev_points(1,1)*curr_points_inv(1,2) + prev_points(1,2)*curr_points_inv(2,2)
-                      }
-                      // println("after if statement")
+                    val pt1 = descriptor_coord_1(i)
+                    val pt2 = descriptor_coord_2(i)
+                    brief_descriptor(i) = 0.to[UInt1]
+                    if (sr(pt1.x.to[Index], pt1.y.to[Index]) > sr(pt2.x.to[Index], pt2.y.to[Index])) {
+                      brief_descriptor(i) = 1.to[UInt1]
                     }
                   }
                 }
-                // compute new cumulative transform: new_cum=M*cum
-                val t00 = M(0,0)*cumulative_M(0,0) + M(0,1)*cumulative_M(1,0)
-                val t01 = M(0,0)*cumulative_M(0,1) + M(0,1)*cumulative_M(1,1)
-                val t02 = M(0,0)*cumulative_M(0,2) + M(0,1)*cumulative_M(1,2) + M(0,2)
-                val t10 = M(1,0)*cumulative_M(0,0) + M(1,1)*cumulative_M(1,0)
-                val t11 = M(1,0)*cumulative_M(0,1) + M(1,1)*cumulative_M(1,1)
-                val t12 = M(1,0)*cumulative_M(0,2) + M(1,1)*cumulative_M(1,2) + M(1,2)
+                // println(brief_descriptor(0) + " " + brief_descriptor(1) + " " +
+                //         brief_descriptor(2) + " " + brief_descriptor(3) + " " + brief_descriptor(4) + " " +
+                //         brief_descriptor(5) + " " + brief_descriptor(6) + " " + brief_descriptor(7) + " " +
+                //         brief_descriptor(8) + " " + brief_descriptor(9) + " " + brief_descriptor(10) + " " +
+                //         brief_descriptor(11) + " " + brief_descriptor(12) + " " + brief_descriptor(13) + " " +
+                //         brief_descriptor(14) + " " + brief_descriptor(15))
+                
+                // val curr_fifo = mux[FIFO[UInt1]](frame_counter.value == 0.to[UInt1], fifoDescriptor1, fifoDescriptor2)
+                // val prev_fifo = mux[FIFO[UInt1]](frame_counter.value == 0.to[UInt1], fifoDescriptor2, fifoDescriptor1)
 
-                // cumulative_M is the affine transform from the current frame to the first frame
-                Sequential {
-                  cumulative_M(0,0) = t00
-                  cumulative_M(0,1) = t01
-                  cumulative_M(0,2) = t02
-                  cumulative_M(1,0) = t10
-                  cumulative_M(1,1) = t11
-                  cumulative_M(1,2) = t12
+                // if (frame_counter.value == 0.to[UInt1]) {
+                //   curr_fifo := fifoDescriptor1
+                // } else {
+                //   prev_fifo := fifoDescriptor2
+                // }
+
+                if (is_first_frame.value.to[Int] == 0 && num_matches.value < 300) {
+                  // println(num_matches.value < 300)
+                  // match with descriptors from previous frame
+                  min_hamming_distance.reset  // 16
+                  second_min_hamming_distance.reset  // 16
+                  // println("finding match " + numDescriptorsPrev.value)
+                  Sequential.Foreach(0 until numDescriptorsPrev.value.to[Index]){ i =>
+                    hamming_distance.reset  // 0
+                    // Foreach(0 until 16){ j =>
+                    //   val bit = prev_fifo.deq()
+                    //   if (bit != brief_descriptor(j)) {
+                    //     hamming_distance := hamming_distance.value + 1
+                    //   }
+                    //   prev_fifo.enq(bit)
+                    // }
+                    // if (frame_counter.value == 0.to[UInt1]) {
+                    //   Foreach(0 until 16){ j =>
+                    //     val bit = fifoDescriptor2.deq()
+                    //     if (bit != brief_descriptor(j)) {
+                    //       hamming_distance := hamming_distance.value + 1
+                    //     }
+                    //     fifoDescriptor2.enq(bit, frame_counter.value == 0.to[UInt1])
+                    //   }
+                    // } else {
+                    //   Foreach(0 until 16){ j =>
+                    //     val bit = fifoDescriptor1.deq()
+                    //     if (bit != brief_descriptor(j)) {
+                    //       hamming_distance := hamming_distance.value + 1
+                    //     }
+                    //     fifoDescriptor1.enq(bit, frame_counter.value == 1.to[UInt1])
+                    //   }
+                    // }
+                    Sequential.Foreach(0 until 16){ j =>
+                      val bit = fifo_prev_descriptors.deq()
+                      if (bit != brief_descriptor(j)) {
+                        hamming_distance := hamming_distance.value + 1
+                      }
+                      fifo_prev_descriptors.enq(bit)
+                    }
+                    if (hamming_distance.value < min_hamming_distance.value) {
+                      second_min_hamming_distance := min_hamming_distance.value
+                      min_hamming_distance := hamming_distance.value
+                      best_match_coord := fifo_prev_coord.deq()
+                      fifo_prev_coord.enq(best_match_coord.value)
+                    } else if (hamming_distance.value < second_min_hamming_distance.value) {
+                      second_min_hamming_distance := hamming_distance.value
+                      fifo_prev_coord.enq(fifo_prev_coord.deq())
+                    } else {
+                      fifo_prev_coord.enq(fifo_prev_coord.deq())
+                    }
+                  }
+                  // TODO: add distance and orientation checks from IEEE paper
+                  if (min_hamming_distance.value.to[Float] / second_min_hamming_distance.value.to[Float] <= hamming_threshold && num_matches.value < 300) {
+                    // it's a match
+                    // println(min_hamming_distance.value.to[Float] + " " + second_min_hamming_distance.value.to[Float])
+                    matches(num_matches.value) = mux[Match](num_matches.value < 300,
+                      Match(x1=best_match_coord.value.x.to[UInt10], y1=best_match_coord.value.y.to[UInt10], x2=c.to[UInt10], y2=r.to[UInt10]),
+                      Match(0.to[UInt10], 0.to[UInt10], 0.to[UInt10], 0.to[UInt10]))
+                    num_matches := mux[Int](num_matches.value < 300, num_matches.value + 1, num_matches.value)
+                    // matches.enq(Match(x1=best_match_coord.value.x.to[UInt10], y1=best_match_coord.value.y.to[UInt10], x2=c.to[UInt10], y2=r.to[UInt10]))
+                  }
+
+                  // // alternate matching scheme
+                  // Foreach(0 until numDescriptorsPrev){ i =>
+                  //   hamming_distance := 0
+                  //   if (frame_counter.value == 0) {
+                  //     Foreach(0 until 16){ j =>
+                  //       val bit = fifoDescriptor2.deq()
+                  //       if (bit != brief_descriptor(j)) {
+                  //         hamming_distance := hamming_distance.value + 1
+                  //       }
+                  //       fifoDescriptor2.enq(bit)
+                  //     }
+                  //   } else {
+                  //     Foreach(0 until 16){ j =>
+                  //       val bit = fifoDescriptor1.deq()
+                  //       if (bit != brief_descriptor(j)) {
+                  //         hamming_distance := hamming_distance.value + 1
+                  //       }
+                  //       fifoDescriptor1.enq(bit)
+                  //     }
+                  //   }
+                  //   if (hamming_distance.value < 12) {
+                  //     // TODO: do something with match
+                  //   }
+                  // }
+
+                  // enqueue the current descriptor
+                  // Foreach(0 until 16){ i =>
+                  //   if (frame_counter.value == 0.to[UInt1]) {
+                  //     fifoDescriptor1.enq(brief_descriptor(i), frame_counter.value == 0.to[UInt1])
+                  //   } else {
+                  //     fifoDescriptor2.enq(brief_descriptor(i), frame_counter.value == 1.to[UInt1])
+                  //   }
+                  // }
                 }
+                Sequential.Foreach(0 until 16){ i =>
+                  fifo_curr_descriptors.enq(brief_descriptor(i))
+                }
+                fifo_curr_coord.enq(Coordinate(c.to[Int16], r.to[Int16]))
+                numDescriptors := numDescriptors.value + 1
+                // println("does this never happen?")
               }
-              println("done 2")
 
-              if (is_first_frame.value.to[Int] == 1) {
-                is_first_frame := 0
+              // // For debug purposes
+              // fifoOut.enq(mux[Int16]((is_feature.value == 1.to[Int16]) && (r > 4.to[Index]), 255, grayscale_pixel))
+              
+              // end of frame updates
+              if (r == R-1 && c == C-1) {
+                // println("end of frame updates")
+                frame_counter := mux[UInt1](frame_counter == 0.to[UInt1], 1, 0)
+                numDescriptorsPrev := numDescriptors.value
+                numDescriptors.reset  // 0
+
+                // println(fifo_prev_descriptors.numel())
+                Sequential.Foreach(0 until fifo_prev_descriptors.numel()){ i =>
+                  fifo_prev_descriptors.deq()
+                }
+                // println(fifo_curr_descriptors.numel())
+                Sequential.Foreach(0 until fifo_curr_descriptors.numel()){ i =>
+                  val bit = fifo_curr_descriptors.deq()
+                  fifo_prev_descriptors.enq(bit)
+                }
+                // println(fifo_prev_coord.numel())
+                Sequential.Foreach(0 until fifo_prev_coord.numel()){ _ =>
+                  fifo_prev_coord.deq()
+                }
+                // println(fifo_curr_coord.numel())
+                Sequential.Foreach(0 until fifo_curr_coord.numel()){ _ =>
+                  fifo_prev_coord.enq(fifo_curr_coord.deq())
+                }
+
+                // println(matches.numel())
+
+                // println("start matches")
+                if (is_first_frame.value.to[Int] == 0) {
+                  // println(matches.numel() / 3)
+                  // println(num_matches.value / 3)
+                  val third = num_matches.value / 3
+                  best_geo_distance.reset  // 10000
+                  // Foreach(0 until matches.numel() / 3){ i =>
+                  Sequential.Foreach(0 until num_matches.value / 3){ i =>
+                    // println("3-match " + i)
+                    Sequential {
+                      // val match1 = matches.deq()
+                      // val match2 = matches.deq()
+                      // val match3 = matches.deq()
+                      val match1 = matches(i)
+                      val match2 = matches(i + third)
+                      val match3 = matches(i + 2*third)
+
+                      // Use Heron's formula to calculate the difference in areas between triangles
+                      val shoelace_prev = 0.5 * ((match1.x1 - match3.x1)*(match2.y1 - match1.y1) -
+                        (match1.x1 - match2.x1)*(match3.y1 - match1.y1)).to[Float]
+                      val area_prev = mux[Float](shoelace_prev >= 0, shoelace_prev, -1 * shoelace_prev)
+                      val shoelace_curr = 0.5 * ((match1.x2 - match3.x2)*(match2.y2 - match1.y2) -
+                        (match1.x2 - match2.x2)*(match3.y2 - match1.y2)).to[Float]
+                      val area_curr = mux[Float](shoelace_curr >= 0, shoelace_curr, -1 * shoelace_curr)
+                      val area_diff = area_curr - area_prev
+                      val geo_distance = mux[Float](area_diff >= 0, area_diff, -1 * area_diff)
+                      // println("geo_distance: " + geo_distance)
+                      
+                      if (geo_distance < best_geo_distance) {
+                        curr_points(0, 0) = match1.x2.to[Float]
+                        curr_points(0, 1) = match2.x2.to[Float]
+                        curr_points(0, 2) = match3.x2.to[Float]
+                        curr_points(1, 0) = match1.y2.to[Float]
+                        curr_points(1, 1) = match2.y2.to[Float]
+                        curr_points(1, 2) = match3.y2.to[Float]
+                        curr_points(2, 0) = 1.to[Float]
+                        curr_points(2, 1) = 1.to[Float]
+                        curr_points(2, 2) = 1.to[Float]
+
+                        // val det = prev_points(0, 0) * (prev_points(1, 1) * prev_points(2, 2) - prev_points(2, 1) * prev_points(1, 2)) -
+                        //   prev_points(0, 1) * (prev_points(1, 0) * prev_points(2, 2) - prev_points(1, 2) * prev_points(2, 0)) +
+                        //   prev_points(0, 2) * (prev_points(1, 0) * prev_points(2, 1) - prev_points(1, 1) * prev_points(2, 0))
+                        val det = curr_points(0, 0) * (curr_points(1, 1) * curr_points(2, 2) - curr_points(2, 1) * curr_points(1, 2)) -
+                          curr_points(0, 1) * (curr_points(1, 0) * curr_points(2, 2) - curr_points(1, 2) * curr_points(2, 0)) +
+                          curr_points(0, 2) * (curr_points(1, 0) * curr_points(2, 1) - curr_points(1, 1) * curr_points(2, 0))
+                        
+                        // println(det)
+                        // println("determinant is 0: " + (det.to[Int] == 0))
+                        // println("before if statement")
+                        if (det.to[Int] != 0) {
+                          best_geo_distance := geo_distance
+                          // println("det " + det)
+                          // println("det int " + det.to[Int])
+
+                          val invdet = 1.0/det.to[Float]
+                          // println("invdet " + invdet)
+                          curr_points_inv(0, 0) = (curr_points(1, 1) * curr_points(2, 2) - curr_points(2, 1) * curr_points(1, 2)).to[Float] * invdet;
+                          curr_points_inv(0, 1) = (curr_points(0, 2) * curr_points(2, 1) - curr_points(0, 1) * curr_points(2, 2)).to[Float] * invdet;
+                          curr_points_inv(0, 2) = (curr_points(0, 1) * curr_points(1, 2) - curr_points(0, 2) * curr_points(1, 1)).to[Float] * invdet;
+                          curr_points_inv(1, 0) = (curr_points(1, 2) * curr_points(2, 0) - curr_points(1, 0) * curr_points(2, 2)).to[Float] * invdet;
+                          curr_points_inv(1, 1) = (curr_points(0, 0) * curr_points(2, 2) - curr_points(0, 2) * curr_points(2, 0)).to[Float] * invdet;
+                          curr_points_inv(1, 2) = (curr_points(1, 0) * curr_points(0, 2) - curr_points(0, 0) * curr_points(1, 2)).to[Float] * invdet;
+                          curr_points_inv(2, 0) = (curr_points(1, 0) * curr_points(2, 1) - curr_points(2, 0) * curr_points(1, 1)).to[Float] * invdet;
+                          curr_points_inv(2, 1) = (curr_points(2, 0) * curr_points(0, 1) - curr_points(0, 0) * curr_points(2, 1)).to[Float] * invdet;
+                          curr_points_inv(2, 2) = (curr_points(0, 0) * curr_points(1, 1) - curr_points(1, 0) * curr_points(0, 1)).to[Float] * invdet;
+
+                          prev_points(0, 0) = match1.x1.to[Float]
+                          prev_points(0, 1) = match2.x1.to[Float]
+                          prev_points(0, 2) = match3.x1.to[Float]
+                          prev_points(1, 0) = match1.y1.to[Float]
+                          prev_points(1, 1) = match2.y1.to[Float]
+                          prev_points(1, 2) = match3.y1.to[Float]
+                          prev_points(2, 0) = 1.to[Float]
+                          prev_points(2, 1) = 1.to[Float]
+                          prev_points(2, 2) = 1.to[Float]
+
+                          // M is the affine transfrom from curr_points to prev_points
+                          M(0, 0) = mux[Float](r == R-1 && c == C-1, prev_points(0,0)*curr_points_inv(0,0) + prev_points(0,1)*curr_points_inv(1,0) + prev_points(0,2)*curr_points_inv(2,0), 1)
+                          M(0, 1) = mux[Float](r == R-1 && c == C-1, prev_points(0,0)*curr_points_inv(0,1) + prev_points(0,1)*curr_points_inv(1,1) + prev_points(0,2)*curr_points_inv(2,1), 0)
+                          M(0, 2) = mux[Float](r == R-1 && c == C-1, prev_points(0,0)*curr_points_inv(0,2) + prev_points(0,1)*curr_points_inv(1,2) + prev_points(0,2)*curr_points_inv(2,2), 0)
+                          M(1, 0) = mux[Float](r == R-1 && c == C-1, prev_points(1,0)*curr_points_inv(0,0) + prev_points(1,1)*curr_points_inv(1,0) + prev_points(1,2)*curr_points_inv(2,0), 0)
+                          M(1, 1) = mux[Float](r == R-1 && c == C-1, prev_points(1,0)*curr_points_inv(0,1) + prev_points(1,1)*curr_points_inv(1,1) + prev_points(1,2)*curr_points_inv(2,1), 1)
+                          M(1, 2) = mux[Float](r == R-1 && c == C-1, prev_points(1,0)*curr_points_inv(0,2) + prev_points(1,1)*curr_points_inv(1,2) + prev_points(1,2)*curr_points_inv(2,2), 0)
+                          // println(M(0,0))
+                          // println(M(0,1))
+                          // println(M(0,2))
+                          // println(M(1,0))
+                          // println(M(1,1))
+                          // println(M(1,2))
+                        }
+                        // println("after if statement")
+                      }
+                    }
+                  }
+                  // compute new cumulative transform: new_cum=M*cum
+                  // println("why is this happening")
+                  val t00 = M(0,0)*cumulative_M(0,0) + M(0,1)*cumulative_M(1,0)
+                  val t01 = M(0,0)*cumulative_M(0,1) + M(0,1)*cumulative_M(1,1)
+                  val t02 = M(0,0)*cumulative_M(0,2) + M(0,1)*cumulative_M(1,2) + M(0,2)
+                  val t10 = M(1,0)*cumulative_M(0,0) + M(1,1)*cumulative_M(1,0)
+                  val t11 = M(1,0)*cumulative_M(0,1) + M(1,1)*cumulative_M(1,1)
+                  val t12 = M(1,0)*cumulative_M(0,2) + M(1,1)*cumulative_M(1,2) + M(1,2)
+
+                  // cumulative_M is the affine transform from the current frame to the first frame
+                  Sequential {
+                    // println("why the heck")
+                    cumulative_M(0,0) = t00
+                    cumulative_M(0,1) = t01
+                    cumulative_M(0,2) = t02
+                    cumulative_M(1,0) = t10
+                    cumulative_M(1,1) = t11
+                    cumulative_M(1,2) = t12
+                    // cumulative_M(0,0) = 1
+                    // cumulative_M(0,1) = 1
+                    // cumulative_M(0,2) = 1
+                    // cumulative_M(1,0) = 1
+                    // cumulative_M(1,1) = 1
+                    // cumulative_M(1,2) = 1
+                  }
+
+                  // println(cumulative_M(0,0))
+                  // println(cumulative_M(0,1))
+                  // println(cumulative_M(0,2))
+                  // println(cumulative_M(1,0))
+                  // println(cumulative_M(1,1))
+                  // println(cumulative_M(1,2))
+                }
+                // println("done 2")
+
+                num_matches.reset
+                if (is_first_frame.value.to[Int] == 1) {
+                  is_first_frame := 0
+                }
+
+                // TODO: select best transformtion with RANSAC
               }
 
-              // TODO: select best transformtion with RANSAC
-            }
+              // val pixel_value = fifoOut.deq()
+              val t_c = cumulative_M(0,0).to[Int]*c + cumulative_M(0,1).to[Int]*r + cumulative_M(0,2).to[Int]
+              val t_r = cumulative_M(1,0).to[Int]*c + cumulative_M(1,1).to[Int]*r + cumulative_M(1,2).to[Int]
+              if (t_c >= 0 && t_c < 320 && t_r >= 0 && t_r < 240) {
+                imgOut(t_r, t_c) = Pixel16(grayscale_pixel(7::3).as[UInt5],
+                  grayscale_pixel(7::2).as[UInt6],
+                  grayscale_pixel(7::3).as[UInt5])
+              }
 
-            val pixel_value = fifoOut.deq()
-            val t_c = cumulative_M(0,0).to[Int]*c + cumulative_M(0,1).to[Int]*r + cumulative_M(0,2).to[Int]
-            val t_r = cumulative_M(1,0).to[Int]*c + cumulative_M(1,1).to[Int]*r + cumulative_M(1,2).to[Int]
-            if (t_c >= 0 && t_c < 320 && t_r >= 0 && t_r < 240) {
-              imgOut(t_r, t_c) = Pixel16(pixel_value(7::3).as[UInt5],
-                pixel_value(7::2).as[UInt6],
-                pixel_value(7::3).as[UInt5])
+              // imgOut(r, c) = Pixel16(pixel_value(7::3).as[UInt5],
+              //   pixel_value(7::2).as[UInt6],
+              //   pixel_value(7::3).as[UInt5])
+              // imgOut(r,c) = Pixel24(pixel_value(7::0).as[UInt8],
+              //   pixel_value(7::0).as[UInt8],
+              //   pixel_value(7::0).as[UInt8])
             }
-            // imgOut(r,c) = Pixel24(pixel_value(7::0).as[UInt8],
-            //   pixel_value(7::0).as[UInt8],
-            //   pixel_value(7::0).as[UInt8])
           }
         }
 
         // TODO: This step should be performed outside of the Foreach loop over the whole frame. You will need to dequeue pixels from fifOut, and send it to imgOut (The StreamOut port).
         // YOUR CODE HERE:
-        println("output")
+
+        // println("output")
+        // println(numDescriptors.value)
+        // println(numDescriptorsPrev.value)
+
         // val pixel_value = fifoOut.deq()
         // imgOut := Pixel24(pixel_value(7::0).as[UInt8],
         //   pixel_value(7::0).as[UInt8],
